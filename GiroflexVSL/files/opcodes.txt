@@ -1,0 +1,25 @@
+Updated 24/03/24
+
+Updated 12/06/24
+* Added 4D5A
+
+Sanny Builder 3/data/sa_mobile/SASCM.ini
+
+; GiroflexVSL
+
+4D50=1,process_giroflex_vsl_lib deltaMs %1d%
+4D51=3,%3g% = get_draw_item_info %1d% id %2d%
+4D52=2,send_touch_state %1d% state %2d%
+4D53=4,send_player_position %1d% pos %2f% %3f% %4f%
+4D54=2,send_current_vehicle %1d% modelid %2d%
+4D55=3,%3g% = get_mod_info %1d% id %2d%
+4D56=4,send_car_velocity %1d% vel %2f% %3f% %4f%
+4D57=2,create_new_vehicle %1d% modelid %2d%
+4D58=4,register_giroflex_corona %1d% at_pos %2f% %3f% %4f%
+4D59=5,send_car_position %1d% model_id %2d% pos %3f% %4f% %5f%
+4D5A=1,add_log_message %1d%
+4D5B=2,send_widget_state %1d% state %2d%
+
+
+Hex Dec table
+https://www.practical-go-lessons.com/img/hex_dec_corresponding.a2b9a7ab.png

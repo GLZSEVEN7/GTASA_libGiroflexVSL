@@ -1,0 +1,1295 @@
+#include "Vehicle.h"
+
+#include "Log.h"
+
+#include "ModConfig.h"
+#include "RenderCorona.h"
+#include "Vehicles.h"
+#include "ModelInfos.h"
+#include "LightGroupDatas.h"
+#include "Patterns.h"
+#include "Globals.h"
+#include "ModConfig.h"
+#include "VehicleDummy.h"
+#include "Mod.h"
+
+#include "RotateObjectManager.h"
+
+#include "windows/WindowEditing.h"
+
+#include "menu/IMenuVSL.h"
+extern IMenuVSL* menuVSL;
+
+extern void* (*GetVehicleFromRef)(int);
+extern RwMatrix* (*RwMatrixRotate)(RwMatrix* matrix, const RwV3d* axis, RwReal angle, RwOpCombineType combineOp);
+extern RwMatrix* (*RwMatrixTranslate)(RwMatrix* matrix, const RwV3d* translation, RwOpCombineType combineOp);
+extern RwMatrix* (*RwMatrixMultiply)(RwMatrix* matrixOut, const RwMatrix* MatrixIn1, const RwMatrix* matrixIn2);
+
+extern void (*RegisterCorona)(unsigned int id, void* attachTo, unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha, CVector const& posn, float radius, float farClip, int coronaType, int flaretype, bool enableReflection, bool checkObstacles, int _param_not_used, float angle, bool longDistance, float nearClip, unsigned char fadeState, float fadeSpeed, bool onlyFromBelow, bool reflectionDelay);
+
+static std::list<std::pair<unsigned int *, unsigned int>> resetEntries;
+
+int Vehicle::m_LightIdOffset = 1000;
+bool Vehicle::m_ShowRotatePointDirection = false;
+
+int LightIdOffset = 10000;
+
+const double TO_RADIANS = M_PI / 180.0;
+
+float GetIntensityFromAngle(float angle)
+{
+    if (angle > M_PI/2)
+    {
+        // A função é mapeada de modo que o valor de 0 a Math.PI se transforme de 0 a 1
+        // Ajuste o valor de "angle" para que ele esteja entre 0 e Math.PI.
+        float mappedValue = (angle - (float)(M_PI / 2)) / (float)(M_PI / 2);
+
+        // Converta o valor para o intervalo [0, 1], onde Math.PI / 2 é 0 e Math.PI é 1.
+        return std::clamp(mappedValue, 0.0f, 1.0f);
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+Vehicle::Vehicle(int hVehicle, int modelId)
+{
+    this->hVehicle = hVehicle;
+    this->modelId = modelId;
+    pVehicle = (CVehicle*)GetVehicleFromRef(hVehicle);
+
+    this->sirenSystem = new SirenSystem(hVehicle);
+
+    std::string vehicleIdString = "Vehicle " + std::to_string(hVehicle) + ": ";
+
+    Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Created" << std::endl;
+
+    //removing this update will case another issue SOME FUCKING WHERE ELSE I DON'T REMEMBER
+    //Update(0);
+    
+
+    /*
+    auto lightGroupDataList = GetLightGroupsData();
+    for (auto lightGroupData : lightGroupDataList)
+    {
+        if(lightGroupData->lightGroup->enableOnSpawn)
+            lightGroupData->lightsOn = true;
+    }
+    */
+}
+
+Vehicle::~Vehicle()
+{
+    Destroy();
+}
+
+void Vehicle::Init()
+{
+    this->sirenSystem->Init();
+}
+
+void Vehicle::Destroy()
+{
+    std::string vehicleIdString = "Vehicle " + std::to_string(hVehicle) + ": ";
+
+    Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Destroy" << std::endl;
+
+    this->sirenSystem->Destroy();
+}
+
+void Vehicle::Update(int dt)
+{
+    std::string vehicleIdString = "Vehicle " + std::to_string(hVehicle) + ": ";
+
+    Log::Level(LOG_LEVEL::LOG_DEEP_UPDATE) << vehicleIdString << "Update" << std::endl;
+
+    ledsTime += dt;
+    if(ledsTime >= 2000) ledsTime = 0;
+
+    this->sirenSystem->Update(dt);
+
+    UpdateLightGroups(dt);
+
+    //-----------
+
+    //Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Getting siren state: " << std::endl;
+
+    //void* vehicleEntity = Mod::ModGetVehicleFromRef(hVehicle);
+    //bool sirenOn = *(uint8_t*)((uintptr_t)vehicleEntity + 0x42D + 4) >> 7;
+
+    //Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "siren state: " << sirenOn << std::endl;
+
+    //if (prevLightsState != gameSirenState)
+    if (prevSirenState != gameSirenState)
+    {
+        prevSirenState = gameSirenState;
+
+        if (pDriver)
+        {
+            if(Globals::hPlayerVehicle == hVehicle)
+            {
+                //player vehicle
+                if(ModConfig::TurnOnLightsWithSiren)
+                {
+                    SirenSystem::PlaySirenToggleSound();
+                    
+                    SetGiroflexEnabled(gameSirenState);
+                }
+            } else {
+                //npc vehicle
+                SetGiroflexEnabled(gameSirenState);
+            }
+        }
+
+        if(!Globals::m_UsingMultiSiren)
+        {
+            //siren audio
+            if(SirenSystem::ModelIdHasSirenGroup(modelId))
+                sirenSystem->ToggleSiren(gameSirenState);
+        }
+    }
+
+    //Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Update end" << std::endl;
+}
+
+void Vehicle::UpdateLightGroups(int dt)
+{
+    std::string vehicleIdString = "Vehicle " + std::to_string(hVehicle) + ": ";
+    
+    if (!ModelInfos::HasModelInfo(modelId)) return;
+
+    auto modelInfo = ModelInfos::GetModelInfo(modelId);
+
+    auto lightId = hVehicle + Vehicle::m_LightIdOffset;
+
+    RotateObjectManager::ProcessVehicle(this);
+
+    for (auto lightGroup : modelInfo->lightGroups)
+    {
+        if (lightGroup->points.size() == 0)
+        {
+            Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Warning: lightGroup (from id: " << modelInfo->modelId << ") has 0 points" << std::endl;
+            continue;
+        }
+
+        //
+
+        if (!LightGroupDatas::HasLightGroupData(lightGroup, hVehicle))
+        {   
+            std::vector<Pattern*> compatiblePatterns = lightGroup->GetPatterns();
+            
+            if(compatiblePatterns.size() == 0)
+            {
+                Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Warning: lightGroup (from id: " << modelInfo->modelId << ") has 0 compatible patterns" << std::endl;
+                continue;
+            }
+
+            LightGroupData* lightGroupData = new LightGroupData(lightGroup, hVehicle);
+
+            for (auto pattern : compatiblePatterns)
+                lightGroupData->patterns.push_back(pattern);
+           
+            LightGroupDatas::AddLightGroupData(lightGroupData);
+
+            Log::Level(LOG_LEVEL::LOG_BOTH) << vehicleIdString << "Created LightGroupData with " << lightGroupData->patterns.size() << " patterns [global: " << LightGroupDatas::m_LightGroupDatas.size() << "]" << std::endl;
+        }
+
+        //if (!lightsOn) continue;
+
+        LightGroupData* lightGroupData = LightGroupDatas::GetLightGroupData(lightGroup, hVehicle);
+
+        if (!lightGroupData)
+        {
+            continue;
+        }
+        
+        if(lightGroupData->lightsOn)
+{
+    lightGroupData->fadeActive = lightGroup->fadeEnabled;
+    lightGroupData->fadeSpeed = lightGroup->fadeSpeed;
+    lightGroupData->UpdateFade(dt);
+}
+else
+{
+    lightGroupData->fadeActive = false;
+    lightGroupData->fadeIntensityA = 1.0f;
+    lightGroupData->fadeIntensityB = 1.0f;
+}
+
+        //
+
+        if (lightGroupData->patternLoop->HasNoSteps())
+        {
+            for (auto pattern : lightGroupData->patterns)
+            {
+                std::cout << pattern << std::endl;
+
+                lightGroupData->patternLoop->AddStep(&Patterns::m_TimeBetweenPatterns);
+            }
+
+            int patternOffset = lightGroup->patternOffset;
+            while (patternOffset > 0)
+            {
+                lightGroupData->patternLoop->StepIndex++;
+                if (lightGroupData->patternLoop->StepIndex >= lightGroupData->patternLoop->Steps.size()) lightGroupData->patternLoop->StepIndex = 0;
+                patternOffset--;
+            }
+
+        }
+
+        //
+
+        //if (!lightsPaused)
+        {
+            lightGroupData->patternLoop->Update(dt);
+
+            if (lightGroupData->patternLoop->HasStepChanged())
+            {
+                //std::cout << "patternLoop step changed" << std::endl;
+                lightGroupData->stepLoop->Clear();
+            }
+
+            //
+
+            Pattern* pattern = lightGroupData->GetCurrentPattern();
+
+            if (pattern == NULL)
+            {
+                //std::cout << "Pattern not found" << std::endl;
+                continue;
+            }
+
+            if (pattern->steps.size() == 0)
+            {
+                //std::cout << "Pattern has no steps" << std::endl;
+                continue;
+            }
+
+            if (lightGroupData->stepLoop->HasNoSteps())
+            {
+                Pattern* pattern = lightGroupData->GetCurrentPattern();
+
+                //std::cout << "add " << pattern->steps.size() << " steps to stepLoop" << std::endl;
+
+                for (auto step : pattern->steps)
+                {
+                    lightGroupData->stepLoop->AddStep(&step->duration);
+                }
+            }
+
+            lightGroupData->stepLoop->Update(dt);
+        }
+
+        //
+
+        if(lightGroup->rotate)
+        {
+            rotateAngle += 0.001f * dt * lightGroup->rotateSpeed;   
+            if(rotateAngle >= 2 * M_PI) rotateAngle = 0;
+
+            //Log::Level(LOG_LEVEL::LOG_BOTH) << "rotateAngle: " << lightGroup->rotateAngle << std::endl;
+        }
+        //
+
+        for (int i = 0; i < (int)lightGroup->points.size(); i++)
+        {
+            auto point = lightGroup->points[i];
+
+            auto amountOfPoints = lightGroup->points.size();
+            auto distance = lightGroup->distance;
+            auto curve = lightGroup->curve;
+
+            auto pointRotateData = RotateObjectManager::GetPointRotateData(this, point);
+            
+            if(pointRotateData->lastMode != point->rotateObject.mode)
+{
+    pointRotateData->lastMode = point->rotateObject.mode;
+
+    pointRotateData->oscillationInitialized = false;
+    pointRotateData->oscillationCurrentAngle = 0.0f;
+    pointRotateData->totalAngle = 0.0f;
+    pointRotateData->originalMatrixSaved = false;
+}
+
+            //position
+            float x = (i * distance) - ((amountOfPoints - 1) * distance / 2);
+			float y = (float)arch_fn_parabola((float)i, curve, (float)(amountOfPoints - 1));
+
+            //rotate position
+            if(lightGroup->rotate)
+            {
+                auto angle = rotateAngle;
+
+                x += std::sin(angle) * lightGroup->rotateDistance * (lightGroup->rotateInverse ? -1 : 1);
+                y += std::cos(angle) * lightGroup->rotateDistance;
+            }
+
+            auto coronaOffset = CVector(x, y, 0) + lightGroup->offset + point->customOffset;
+
+            //color
+CRGBA color = lightGroup->ledColor1Enabled;
+CRGBA coronaColor = color;
+
+if((double)i < ((double)amountOfPoints)/(double)2)
+{
+    color = lightGroup->color1;
+
+    if(amountOfPoints%2 == 1 && i == std::round(amountOfPoints/2) && amountOfPoints > 2)
+    {
+        color = lightGroup->color3;
+    }
+}
+else
+{
+    color = lightGroup->color2;
+}
+
+coronaColor = color;
+
+//pattern color
+auto step = lightGroupData->GetCurrenetStep();
+
+if(step == nullptr)
+{
+    continue;
+}
+
+if(step->useCustomLedColor && i < step->ledColors.size())
+{
+    color = step->ledColors[i].ledColor;
+    coronaColor = step->ledColors[i].coronaColor;
+}
+else if(step->useCustomColor)
+{
+    coronaColor = step->customColor;
+}
+else
+{
+    coronaColor = color;
+}
+
+            //custom color
+            if(point->useCustomColor)
+{
+    coronaColor = point->customColor;
+}
+            
+            //
+            int index = i;
+
+            bool enabled = lightGroupData->GetPointIsEnabled(point, index);
+            
+            if (lightGroup->freezeLights) enabled = true;
+
+            if (!lightGroupData->lightsOn && !lightGroup->alwaysEnabled) enabled = false;
+
+            if (WindowEditing::FreezeLights) enabled = true;
+
+            if (WindowEditing::ShowCurrentEditingLightGroup)
+            {
+                if (WindowEditing::LightGroupToShow != lightGroup) enabled = false;
+            }
+
+            //menuVSL->debug->m_Visible = true;
+
+            auto radius = lightGroup->radius;
+
+            //auto positionY = lightGroup->offset.y + point->customOffset.y;
+            
+            //---------------------------------------
+            // get angle and direction
+            // and I hate this, cuz its hard, or im just too stupid for this, idk
+
+            auto vehiclePos = pVehicle->m_matrix->pos;
+            CVector cameraPos = camera->m_matrix->pos;
+            float coronaOffsetX = coronaOffset.x;
+
+            auto vec1 = TransformFromObjectSpace(pVehicle, CVector(-coronaOffsetX, 0, 0));
+            vec1.z = vehiclePos.z;
+
+            auto vec2 = vehiclePos;
+
+            auto vec3 = cameraPos;
+            vec3.z = vehiclePos.z;
+
+            auto vec1_2d = CVector2D(vec1.x, vec1.y);
+            auto vec2_2d = CVector2D(vec2.x, vec2.y);
+            auto vec3_2d = CVector2D(vec3.x, vec3.y);
+
+            auto angle = calculateAngleVec2D(vec1_2d, vec2_2d, vec3_2d);
+            
+            eSirenDirection direction = lightGroup->direction;
+
+            if(point->customDirection != eSirenDirection::BOTH)
+            {
+                direction = point->customDirection;
+            }
+
+            //
+
+            float radiusMult = 0.0f;
+            bool isCoronaAtLeft = coronaOffsetX < 0;
+            bool isCoronaAtRight = !isCoronaAtLeft;
+
+            float newAngle = angle;  // já em [-180, 180]
+            
+            // Espelha ângulo para luz direita
+            if (isCoronaAtLeft)
+            {
+                newAngle = -newAngle;
+            }
+
+            if(direction == eSirenDirection::BOTH)
+            {
+                radiusMult = 1.0f;
+            }
+            else if (direction == eSirenDirection::FRONT)
+            {
+                // FRONT: visível próximo de 0°
+
+                if (newAngle >= 0.0f && newAngle <= 20.0f)
+                {
+                    // Fade out 0 -> 20 (0 = invisível, 20 = visível)
+                    radiusMult = newAngle / 20.0f;
+                }
+                else if (newAngle > 20.0f && newAngle < 160.0f)
+                {
+                    // Totalmente visível
+                    radiusMult = 1.0f;
+                }
+                else if (newAngle >= 160.0f && newAngle <= 180.0f)
+                {
+                    // Fade in 160 -> 180 (160 = visível, 180 = invisível)
+                    radiusMult = (180.0f - newAngle) / 20.0f;
+                }
+                else
+                {
+                    radiusMult = 0.0f;
+                }
+            }
+            else if (direction == eSirenDirection::BACK)
+            {
+                // BACK: visível próximo de -180°
+
+                if (newAngle >= -180.0f && newAngle <= -160.0f)
+                {
+                    // Fade in -180 -> -160 (-180 = invisível, -160 = visível)
+                    radiusMult = (newAngle + 180.0f) / 20.0f;
+                }
+                else if (newAngle > -160.0f && newAngle < -20.0f)
+                {
+                    // Totalmente visível
+                    radiusMult = 1.0f;
+                }
+                else if (newAngle >= -20.0f && newAngle <= 0.0f)
+                {
+                    // Fade out -20 -> 0 (-20 = visível, 0 = invisível)
+                    radiusMult = (-newAngle) / 20.0f;
+                }
+                else
+                {
+                    radiusMult = 0.0f;
+                }
+            }
+            else if (direction == eSirenDirection::SIDES)
+{
+    float sideRange = ModConfig::SideLightsVisibleRange;
+    float sideFade = 10.0f;
+
+    // SIDES: usa o valor definido no settings.ini
+    // side_lights_visible_range = X
+    // Fade fixo de 10 graus nas bordas.
+
+    // Espelha para unificar lógica LEFT/RIGHT
+    if (isCoronaAtRight)
+    {
+        newAngle = -newAngle;
+    }
+
+    if (newAngle >= -(sideRange + sideFade) && newAngle < -sideRange)
+    {
+        // Fade in
+        radiusMult = (newAngle + (sideRange + sideFade)) / sideFade;
+    }
+    else if (newAngle >= -sideRange && newAngle <= sideRange)
+    {
+        // Totalmente visível
+        radiusMult = 1.0f;
+    }
+    else if (newAngle > sideRange && newAngle <= (sideRange + sideFade))
+    {
+        // Fade out
+        radiusMult = ((sideRange + sideFade) - newAngle) / sideFade;
+    }
+    else
+    {
+        // Fora da faixa → invisível
+        radiusMult = 0.0f;
+    }
+}
+
+            radiusMult = std::clamp(radiusMult, 0.0f, 1.0f);
+
+            //
+
+            if(hVehicle == Globals::hPlayerVehicle)
+            {
+                // menuVSL->debug->visible = true;
+                // menuVSL->debug->AddLine("angle: " + std::to_string(angle));
+                // menuVSL->debug->AddLine("radiusMult: " + std::to_string(radiusMult));
+                // menuVSL->debug->AddLine("dir: " + std::string(isCoronaAtLeft ? "LEFT" : "RIGHT"));
+            }
+
+            radius = lightGroup->radius * radiusMult;
+
+            //---------------------------------------
+
+            if(point->rotateObject.rotate && pointRotateData->matrix != NULL)
+            {
+                //int lightId = 10000;
+
+                //RegisterTestCorona2(lightId++, coronaOffset, CRGBA(0, 255, 0), 2.0f);
+
+                auto coronaWorldPosition = TransformFromObjectSpace(pVehicle, coronaOffset);
+
+                auto carForward = CMatrixGetForward(pVehicle->m_matrix);
+
+                //roll
+
+                auto roll = pointRotateData->roll + point->rotateObject.directionFix;
+
+                //
+
+                auto newDir = RotateVectorAroundZ(carForward, roll);
+
+                auto coronaForwardedPosition = coronaWorldPosition + newDir;
+
+                // ------------------
+
+                auto cameraPosition = camera->m_matrix->pos;
+
+                auto vec1 = coronaForwardedPosition;
+                vec1.z = coronaWorldPosition.z;
+
+                auto vec2 = coronaWorldPosition;
+
+                auto vec3 = cameraPosition;
+                vec3.z = coronaWorldPosition.z;
+
+                // pos Z is ignored :)
+                auto angle = GetAngleBetweenVectors(vec1, vec2, vec3);
+
+                float intensity = GetIntensityFromAngle(angle);
+
+                //if vehicle is the player's
+
+                radius *= intensity;
+            }
+
+            //---------------------------------------
+
+            if(coronaColor.a == 0) enabled = false;
+
+RenderCorona corona;
+corona.car = hVehicle;
+corona.pVehicle = pVehicle;
+corona.id = lightId++;
+
+if(lightGroupData->fadeActive)
+{
+    int half = lightGroup->points.size() / 2;
+
+    float fade = (index < half)
+        ? lightGroupData->fadeIntensityA
+        : lightGroupData->fadeIntensityB;
+
+    coronaColor.r *= fade;
+    coronaColor.g *= fade;
+    coronaColor.b *= fade;
+}
+
+corona.color = coronaColor;
+
+float smooth = lightGroupData->GetSmoothIntensity(i, enabled, dt);
+
+if(lightGroup->smoothLedFade)
+{
+    corona.color.r *= smooth;
+    corona.color.g *= smooth;
+    corona.color.b *= smooth;
+    corona.color.a *= smooth;
+}
+
+corona.offset = coronaOffset;
+
+if(enabled)
+{
+    if(lightGroupData->fadeActive)
+    {
+        int half = lightGroup->points.size() / 2;
+
+float intensity = (i < half)
+    ? lightGroupData->fadeIntensityA
+    : lightGroupData->fadeIntensityB;
+
+corona.radius = radius * intensity;
+
+if(lightGroup->smoothLedFade)
+    corona.radius *= smooth;
+    }
+    else
+    {
+        corona.radius = radius;
+
+if(lightGroup->smoothLedFade)
+    corona.radius *= smooth;
+
+if(lightGroup->smoothLedFade)
+{
+    corona.radius *= smooth;
+}
+    }
+}
+else
+{
+    corona.radius = 0.0f;
+}
+
+corona.renderShadow = enabled ? lightGroup->renderShadow : false;
+corona.renderPointLight = enabled ? lightGroup->renderPointLight : false;
+
+corona.shadowIntensity = lightGroup->shadowIntensity;
+corona.shadowSize = lightGroup->shadowSize;
+
+//shadow offset X
+//corona.shadowOffsetX = lightGroup->shadowPositionX;
+auto dir = (coronaOffset.x > 0) ? 1 : -1;
+float margin = 0.15f;
+float sdistance = abs(coronaOffset.x);
+
+corona.shadowOffsetX = coronaOffset.x + (dir * lightGroup->shadowPositionX);
+if (sdistance > margin)
+{
+    //corona.shadowOffsetX += (dir * lightGroup->shadowSize / 2);
+}
+
+if(lightGroup->rotate) corona.shadowOffsetX = lightGroup->shadowPositionX;
+
+//
+
+corona.shadowOffsetY = lightGroup->shadowPositionY;
+corona.shadowTexture = lightGroup->shadowTexture;
+
+corona.shadowRotation = lightGroup->shadowRotation;
+if (lightGroup->rotate)
+    corona.shadowRotation = -rotateAngle * (lightGroup->rotateInverse ? -1 : 1);
+
+corona.shadowFlipTextures = lightGroup->shadowFlipTextures;
+
+corona.pointLightDistance = lightGroup->pointLightDistance;
+corona.pointLightIntensity = lightGroup->pointLightIntensity;
+
+corona.nearClip = lightGroup->nearClip;
+corona.useFlare = enabled ? lightGroup->useFlare : false;
+corona.flareIntensity = lightGroup->flareIntensity;
+corona.flareDistance = lightGroup->flareDistance;
+corona.flareTexture = lightGroup->flareTexture;
+corona.coronaTexture = lightGroup->coronaTexture;
+
+Vehicles::AddCoronaToRender(corona);
+
+if (corona.useFlare)
+    lightId++;
+
+if (lightGroup->useSmallWhiteCorona)
+{
+    RenderCorona corona2;
+    corona2.car = hVehicle;
+    corona2.pVehicle = pVehicle;
+    corona2.id = lightId++;
+
+    // Cor padrão
+    // Cor padrão
+corona2.color = lightGroup->smallWhiteCoronaColor;
+
+// Cor individual do ponto
+if (point->useCustomWhiteCoronaColor)
+{
+    corona2.color = point->customWhiteCoronaColor;
+}
+
+// Cor personalizada pelo Pattern
+auto step = lightGroupData->GetCurrenetStep();
+
+if(step->useCustomLedColor && i < step->ledColors.size())
+{
+    auto& led = step->ledColors[i];
+
+    if(led.whiteCoronaColor.a != 0)
+    {
+        corona2.color = led.whiteCoronaColor;
+    }
+    else
+    {
+        // Compatibilidade com patterns antigos
+        corona2.color = lightGroup->smallWhiteCoronaColor;
+    }
+}
+
+    corona2.radius = corona.radius * lightGroup->smallWhiteCoronaScale;
+corona2.nearClip = corona.nearClip;
+corona2.coronaTexture = lightGroup->smallWhiteCoronaTexture;
+
+for (int c = 0; c < point->whiteCoronaCount; c++)
+{
+    corona2.id = lightId++;
+
+    corona2.offset = corona.offset;
+
+    if(c < point->whiteCoronaOffsets.size())
+    {
+        corona2.offset += point->whiteCoronaOffsets[c];
+    }
+
+    corona2.offset.z += c * 0.01f;
+
+
+    // debug
+    if(c == WindowEditing::SelectedWhiteCorona)
+    {
+        // esse é o selecionado
+    }
+
+
+    Vehicles::AddCoronaToRender(corona2);
+}
+
+}
+
+        } // fecha o for (points)
+    } // fecha o for (lightGroups)
+} // fecha Vehicle::UpdateLightGroups()
+
+/*
+doest work
+*/
+void Vehicle::RegisterDebugCorona(int lightId, CVector worldPostion, CRGBA color)
+{
+    RenderCorona corona2;
+    corona2.car = 0;
+    corona2.pVehicle = NULL;
+    corona2.id = lightId;
+    corona2.color = color;
+    corona2.offset = worldPostion;
+    corona2.radius = 1.0f;
+    corona2.nearClip = 0.1f;
+    corona2.coronaTexture = 0;
+    Vehicles::AddCoronaToRender(corona2);
+}
+
+void Vehicle::OnUpdateGameLogic()
+{   
+    auto lightId = hVehicle + 5000;
+
+    auto testpos = TransformFromObjectSpace(pVehicle, CVector(0, 0, 3));
+
+    //RegisterTestCorona(lightId++, testpos, CRGBA(0, 255, 0), 2.0f);
+
+    if (!ModelInfos::HasModelInfo(modelId)) return;
+
+    auto modelInfo = ModelInfos::GetModelInfo(modelId);
+
+    for (auto lightGroup : modelInfo->lightGroups)
+    {
+        LightGroupData* lightGroupData = LightGroupDatas::GetLightGroupData(lightGroup, hVehicle);
+
+        if (!lightGroupData)
+        {
+            continue;
+        }
+
+        for (int i = 0; i < (int)lightGroup->points.size(); i++)
+        {
+            auto point = lightGroup->points[i];
+
+            auto amountOfPoints = lightGroup->points.size();
+            auto distance = lightGroup->distance;
+            auto curve = lightGroup->curve;
+
+            auto pointRotateData = RotateObjectManager::GetPointRotateData(this, point);
+
+            //position
+            float x = (i * distance) - ((amountOfPoints - 1) * distance / 2);
+			float y = (float)arch_fn_parabola((float)i, curve, (float)(amountOfPoints - 1));
+
+            //rotate position
+            if(lightGroup->rotate)
+            {
+                auto angle = rotateAngle;
+
+                x += std::sin(angle) * lightGroup->rotateDistance * (lightGroup->rotateInverse ? -1 : 1);
+                y += std::cos(angle) * lightGroup->rotateDistance;
+            }
+
+            auto coronaOffset = CVector(x, y, 0) + lightGroup->offset + point->customOffset;
+
+            auto radius = lightGroup->radius;
+
+            if(point->rotateObject.rotate && pointRotateData->matrix != NULL)
+            {
+                auto coronaWorldPosition = TransformFromObjectSpace(pVehicle, coronaOffset);
+
+                auto carForward = CMatrixGetForward(pVehicle->m_matrix);
+
+                //roll
+
+                auto roll = pointRotateData->roll + point->rotateObject.directionFix;
+
+                //
+
+                auto newDir = RotateVectorAroundZ(carForward, roll);
+
+                auto coronaForwardedPosition = coronaWorldPosition + newDir;
+
+                // ------------------
+
+                auto cameraPosition = camera->m_matrix->pos;
+
+                auto vec1 = coronaForwardedPosition;
+                vec1.z = coronaWorldPosition.z;
+
+                auto vec2 = coronaWorldPosition;
+
+                auto vec3 = cameraPosition;
+                vec3.z = coronaWorldPosition.z;
+
+                // pos Z is ignored :)
+                auto angle = GetAngleBetweenVectors(vec1, vec2, vec3);
+
+                float intensity = GetIntensityFromAngle(angle);
+
+                if(m_ShowRotatePointDirection)
+                {
+
+                    RegisterTestCorona(lightId++, vec1, CRGBA(255, 0, 0), 1.0f);
+                    //RegisterTestCorona(lightId++, vec2, CRGBA(0, 255, 0), 1.0f);
+                    RegisterTestCorona(lightId++, vec3, CRGBA(0, 0, 255), 1.0f);
+                }
+
+                radius *= intensity;
+            }
+        }
+    }
+}
+
+void Vehicle::RenderBefore()
+{
+    if (!ModelInfos::HasModelInfo(modelId)) return;
+
+    auto modelInfo = ModelInfos::GetModelInfo(modelId);
+
+    auto atomics = VehicleDummy::RpClumpGetAllAtomics(pVehicle->m_pRwClump);
+	for (auto atomic : atomics)
+	{
+		if (!atomic->geometry) continue;
+
+		atomic->geometry->flags |= rpGEOMETRYMODULATEMATERIALCOLOR;
+
+		auto frameAtomic = GetObjectParent((RwObject*)atomic);
+		auto name = VehicleDummy::GetFrameName(frameAtomic);
+		//CVector position = m_Vehicle->TransformFromObjectSpace(GetFrameNodePosition(frameAtomic));
+
+        //Log::Level(LOG_LEVEL::LOG_BOTH) << "name: " << name << std::endl;
+
+        //rotate objects
+        for (auto lightGroup : modelInfo->lightGroups)
+        {
+            LightGroupData* lightGroupData = LightGroupDatas::GetLightGroupData(lightGroup, hVehicle);
+
+            if (!lightGroupData)
+            {
+                continue;
+            }
+
+            for (int i = 0; i < (int)lightGroup->points.size(); i++)
+            {
+                auto point = lightGroup->points[i];
+                auto index = i;
+                
+                if(to_lower(point->rotateObject.object) != to_lower(name))
+                {
+                    continue;
+                }
+                
+                //
+                bool enabled = lightGroupData->GetPointIsEnabled(point, index);
+                
+                if (lightGroup->freezeLights) enabled = true;
+
+                if (!lightGroupData->lightsOn && !lightGroup->alwaysEnabled) enabled = false;
+
+                if (WindowEditing::FreezeLights) enabled = true;
+
+                if (WindowEditing::ShowCurrentEditingLightGroup)
+                {
+                    if (WindowEditing::LightGroupToShow != lightGroup) enabled = false;
+                }
+
+                //
+
+                if(!point->rotateObject.rotateAlways)
+                {
+                    if(!lightGroupData->lightsOn) continue;
+                }
+
+                auto axisVal = point->rotateObject.axis;
+
+                RwV3d axis = {
+                    (float)(axisVal == eRotateObjectAxis::X ? 1 : 0),
+                    (float)(axisVal == eRotateObjectAxis::Y ? 1 : 0),
+                    (float)(axisVal == eRotateObjectAxis::Z ? 1 : 0)
+                };
+                
+                auto pointRotateData = RotateObjectManager::GetPointRotateData(this, point);
+
+if(!pointRotateData->oscillationInitialized)
+{
+    pointRotateData->oscillationForward =
+        (point->rotateObject.speed >= 0.0f);
+
+    pointRotateData->oscillationInitialized = true;
+}
+    
+                RwReal angleToAdd = std::abs(point->rotateObject.speed);
+
+angleToAdd *= Mod::m_DeltaTime;
+angleToAdd /= 30;
+
+if(point->rotateObject.mode == eRotateMode::OSCILLATE)
+{
+    if(!pointRotateData->oscillationForward)
+    {
+        angleToAdd = -angleToAdd;
+    }
+
+    if(pointRotateData->oscillationNegative)
+    {
+        angleToAdd = -angleToAdd;
+    }
+}
+
+if(!pointRotateData->originalMatrixSaved)
+{
+    pointRotateData->originalMatrix = frameAtomic->modelling;
+    pointRotateData->originalMatrixSaved = true;
+}
+
+if(point->rotateObject.mode == eRotateMode::CONTINUOUS)
+{
+    RwMatrixRotate(
+        &frameAtomic->modelling,
+        &axis,
+        angleToAdd,
+        rwCOMBINEPRECONCAT
+    );
+}
+else
+{
+    frameAtomic->modelling = pointRotateData->originalMatrix;
+
+    float renderAngle = pointRotateData->oscillationCurrentAngle;
+
+if(point->rotateObject.speed < 0.0f)
+{
+    renderAngle = -renderAngle;
+}
+
+RwMatrixRotate(
+    &frameAtomic->modelling,
+    &axis,
+    renderAngle,
+    rwCOMBINEPRECONCAT
+);
+
+}
+
+                if(point->rotateObject.mode == eRotateMode::CONTINUOUS)
+{
+    pointRotateData->totalAngle += angleToAdd;
+}
+else
+{
+    pointRotateData->oscillationCurrentAngle += angleToAdd;
+}
+                
+                if(point->rotateObject.mode == eRotateMode::OSCILLATE)
+{
+    float limit = point->rotateObject.oscillationAngle;
+
+    if(pointRotateData->oscillationCurrentAngle >= limit)
+    {
+        pointRotateData->oscillationCurrentAngle = limit;
+        pointRotateData->oscillationForward = false;
+    }
+    else if(pointRotateData->oscillationCurrentAngle <= -limit)
+    {
+        pointRotateData->oscillationCurrentAngle = -limit;
+        pointRotateData->oscillationForward = true;
+    }   
+}
+
+                //by chatGPT
+
+                float yaw, pitch, roll;
+
+                // Verifica se a matriz está alinhada para evitar valores indefinidos
+                if (frameAtomic->modelling.at.y > 0.998f) { // Singularidade no polo norte
+                    yaw = atan2f(frameAtomic->modelling.right.z, frameAtomic->modelling.right.x);
+                    pitch = M_PI_2;
+                    roll = 0.0f;
+                } else if (frameAtomic->modelling.at.y < -0.998f) { // Singularidade no polo sul
+                    yaw = atan2f(frameAtomic->modelling.right.z, frameAtomic->modelling.right.x);
+                    pitch = -M_PI_2;
+                    roll = 0.0f;
+                } else {
+                    yaw = atan2f(-frameAtomic->modelling.at.x, frameAtomic->modelling.at.z);
+                    pitch = asinf(frameAtomic->modelling.at.y);
+                    roll = atan2f(-frameAtomic->modelling.up.y, frameAtomic->modelling.right.y);
+                }
+
+                pointRotateData->roll = roll;
+
+                pointRotateData->matrix = &frameAtomic->modelling;
+            }
+        }
+
+        //leds
+        for (auto lightGroup : modelInfo->lightGroups)
+        {
+            if(!lightGroup->useLightbarLEDs && !lightGroup->useNormalLEDs) continue;
+
+            LightGroupData* lightGroupData = LightGroupDatas::GetLightGroupData(lightGroup, hVehicle);
+
+            if (!lightGroupData)
+            {
+                continue;
+            }
+
+            for (int i = 0; i < (int)lightGroup->points.size(); i++)
+            {
+                auto point = lightGroup->points[i];
+                auto amountOfPoints = lightGroup->points.size();
+
+                if(lightGroup->useLightbarLEDs)
+                {
+                    int ledIndex = i + lightGroup->lightbarLEDStartIndex;
+
+                    if (to_lower(name).compare(to_lower("lightbar-led-" + std::to_string(ledIndex))) != 0) continue;
+                }
+
+                if(lightGroup->useNormalLEDs)
+                {
+                    int ledIndex = i + lightGroup->normalLEDStartIndex;
+
+                    if (to_lower(name).compare(to_lower("led-" + std::to_string(ledIndex))) != 0) continue;
+                }
+
+                //color
+                CRGBA color = lightGroup->ledColor1Enabled;
+                CRGBA coronaColor = color;
+                if((double)i < ((double)amountOfPoints)/(double)2)
+                {
+                    color = lightGroup->ledColor1Enabled;
+
+                    if(amountOfPoints%2 == 1 && i == std::round(amountOfPoints/2) && amountOfPoints > 2)            
+                    {
+                        color = lightGroup->ledColor3Enabled;
+                    }
+                } else {
+                    color = lightGroup->ledColor2Enabled;
+                }
+                
+                coronaColor = color;
+
+                //pattern color
+                //pattern LED color
+auto step = lightGroupData->GetCurrenetStep();
+
+if(step->useCustomLedColor && i < step->ledColors.size())
+{
+    color = step->ledColors[i].ledColor;
+    coronaColor = step->ledColors[i].coronaColor;
+}
+
+//individual led color
+if(point->useCustomColor)
+{
+    color = point->customLedColor_on;
+}
+
+                //
+                int index = i;
+
+                bool enabled = lightGroupData->GetPointIsEnabled(point, index);
+                
+                if (lightGroup->freezeLights) enabled = true;
+
+                if (!lightGroupData->lightsOn && !lightGroup->alwaysEnabled) enabled = false;
+
+                if (WindowEditing::FreezeLights) enabled = true;
+
+                if (WindowEditing::ShowCurrentEditingLightGroup)
+                {
+                    if (WindowEditing::LightGroupToShow != lightGroup) enabled = false;
+                }
+
+                if (!enabled)
+				{
+					color = lightGroup->ledColorDisabled;
+
+                    //individual point led color, off
+                    if(point->useCustomColor)
+{
+    color = point->customLedColor_off;
+}
+				}
+				
+				// aplica fade nos LEDs igual ao corona
+				
+float fade = 1.0f;
+
+if(lightGroupData->fadeActive)
+{
+    int half = lightGroup->points.size() / 2;
+
+    fade = (i < half)
+        ? lightGroupData->fadeIntensityA
+        : lightGroupData->fadeIntensityB;
+}
+
+color.r *= fade;
+color.g *= fade;
+color.b *= fade;
+color.a *= fade;
+
+if(lightGroup->smoothLedFade)
+{
+    float smooth = lightGroupData->GetSmoothIntensity(i, enabled, Mod::m_DeltaTime);
+
+color.r *= smooth;
+color.g *= smooth;
+color.b *= smooth;
+color.a *= smooth;
+}
+
+                auto materials = VehicleDummy::RpGeometryGetAllMaterials(atomic->geometry);
+				for (auto material : materials)
+				{
+					//if (!material) continue;
+
+					material->color = { color.r, color.g, color.b, color.a };
+					
+					material->surfaceProps.ambient = 10;
+					material->surfaceProps.diffuse = 10;
+					material->surfaceProps.specular = 10;
+				}
+            }
+        }
+    }
+}
+
+void Vehicle::RenderAfter()
+{
+    for (auto &p : resetEntries)
+    *p.first = p.second;
+
+    resetEntries.clear();
+}
+
+std::vector<LightGroupData*> Vehicle::GetLightGroupsData()
+{
+	std::vector<LightGroupData*> lightGroupDataList;
+
+	if (!ModelInfos::HasModelInfo(this->modelId)) return lightGroupDataList;
+
+	auto modelInfo = ModelInfos::GetModelInfo(this->modelId);
+
+	for (auto lightGroup : modelInfo->lightGroups)
+	{
+        auto lightGroupData = LightGroupDatas::GetLightGroupData(lightGroup, this->hVehicle);
+
+        if(lightGroupData)
+            lightGroupDataList.push_back(lightGroupData);
+	}
+
+	return lightGroupDataList;
+}
+
+void Vehicle::SetGiroflexEnabled(bool enabled, bool forceOn)
+{
+    prevLightsState = enabled;
+    //lightsPaused = !enabled;
+    //lightsOn = enabled;
+
+    auto lightGroupDataList = GetLightGroupsData();
+    for (auto lightGroupData : lightGroupDataList)
+    {
+        if(!forceOn && !lightGroupData->lightsOn && !lightGroupData->lightGroup->enableWithLights)
+        {
+            continue;
+        }
+
+        lightGroupData->lightsOn = enabled;
+    }
+
+	/*
+	std::cout << "lightGroupDataList " << lightGroupDataList.size() << std::endl;
+
+	for (auto lightGroupData : lightGroupDataList)
+	{
+		lightGroupData->stepLoop->DontChangeSteps = !enabled;
+	}
+	*/
+}
+
+void Vehicle::ResetObjectRotation(std::string object)
+{
+	auto frame = VehicleDummy::FindDummy(pVehicle, object);
+
+	if (!frame) return;
+
+	RwV3d axis = {0, 0, 0};
+	RwReal angle = 0.0f;
+	RwV3d pos = (RwV3d)frame->modelling.pos;
+	
+	RwMatrixRotate(&frame->modelling, &axis, angle, rwCOMBINEREPLACE);
+	RwMatrixTranslate(&frame->modelling, &pos, rwCOMBINEREPLACE);
+}
+
+void Vehicle::RegisterTestCorona(int lightId, CVector position, CRGBA color, float radius)
+{
+    RegisterCorona(
+        lightId++,
+        NULL,
+        color.r,
+        color.g,
+        color.b,
+        255,
+        { position.x, position.y, position.z },
+        radius,
+        1000.0f,
+        0,
+        0,
+        true,
+        false,
+        0,
+        0.0f,
+        false,
+        0.0f,
+        0,
+        10000.0f,
+        false,
+        false
+    );
+}
